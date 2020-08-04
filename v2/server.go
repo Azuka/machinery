@@ -14,36 +14,41 @@ import (
 	"github.com/RichardKnop/machinery/v1/config"
 	"github.com/RichardKnop/machinery/v1/log"
 	"github.com/RichardKnop/machinery/v1/tasks"
-	"github.com/RichardKnop/machinery/v1/tracing"
 	"github.com/RichardKnop/machinery/v1/utils"
 
 	backendsiface "github.com/RichardKnop/machinery/v1/backends/iface"
 	brokersiface "github.com/RichardKnop/machinery/v1/brokers/iface"
 	lockiface "github.com/RichardKnop/machinery/v1/locks/iface"
-	opentracing "github.com/opentracing/opentracing-go"
 )
 
 // Server is the main Machinery object and stores all configuration
 // All the tasks workers process are registered against the server
 type Server struct {
-	config            *config.Config
-	registeredTasks   *sync.Map
-	broker            brokersiface.Broker
-	backend           backendsiface.Backend
-	lock              lockiface.Lock
-	scheduler         *cron.Cron
-	prePublishHandler func(*tasks.Signature)
+	config                 *config.Config
+	registeredTasks        *sync.Map
+	broker                 brokersiface.Broker
+	backend                backendsiface.Backend
+	lock                   lockiface.Lock
+	scheduler              *cron.Cron
+	prePublishHandler      func(context.Context, *tasks.Signature) func()
+	preChainPublishHandler func(context.Context, *tasks.Chain) func()
+	preChordPublishHandler func(context.Context, *tasks.Chord, int) func()
+	preGroupPublishHandler func(context.Context, *tasks.Group, int) func()
 }
 
 // NewServer creates Server instance
 func NewServer(cnf *config.Config, brokerServer brokersiface.Broker, backendServer backendsiface.Backend, lock lockiface.Lock) *Server {
 	srv := &Server{
-		config:          cnf,
-		registeredTasks: new(sync.Map),
-		broker:          brokerServer,
-		backend:         backendServer,
-		lock:            lock,
-		scheduler:       cron.New(),
+		config:                 cnf,
+		registeredTasks:        new(sync.Map),
+		broker:                 brokerServer,
+		backend:                backendServer,
+		lock:                   lock,
+		scheduler:              cron.New(),
+		prePublishHandler:      defaultPrePublishHandler,
+		preChainPublishHandler: defaultPreChainPublishHandler,
+		preChordPublishHandler: defaultPreChordPublishHandler,
+		preGroupPublishHandler: defaultPreGroupPublishHandler,
 	}
 
 	// Run scheduler job
@@ -55,12 +60,16 @@ func NewServer(cnf *config.Config, brokerServer brokersiface.Broker, backendServ
 // NewServerWithBrokerBackend ...
 func NewServerWithBrokerBackendLock(cnf *config.Config, brokerServer brokersiface.Broker, backendServer backendsiface.Backend, lock lockiface.Lock) *Server {
 	srv := &Server{
-		config:          cnf,
-		registeredTasks: new(sync.Map),
-		broker:          brokerServer,
-		backend:         backendServer,
-		lock:            lock,
-		scheduler:       cron.New(),
+		config:                 cnf,
+		registeredTasks:        new(sync.Map),
+		broker:                 brokerServer,
+		backend:                backendServer,
+		lock:                   lock,
+		scheduler:              cron.New(),
+		prePublishHandler:      defaultPrePublishHandler,
+		preChainPublishHandler: defaultPreChainPublishHandler,
+		preChordPublishHandler: defaultPreChordPublishHandler,
+		preGroupPublishHandler: defaultPreGroupPublishHandler,
 	}
 
 	// Run scheduler job
@@ -72,20 +81,24 @@ func NewServerWithBrokerBackendLock(cnf *config.Config, brokerServer brokersifac
 // NewWorker creates Worker instance
 func (server *Server) NewWorker(consumerTag string, concurrency int) *Worker {
 	return &Worker{
-		server:      server,
-		ConsumerTag: consumerTag,
-		Concurrency: concurrency,
-		Queue:       "",
+		server:          server,
+		ConsumerTag:     consumerTag,
+		Concurrency:     concurrency,
+		Queue:           "",
+		preTaskHandler:  defaultPreTaskHandler,
+		postTaskHandler: defaultPostTaskHandler,
 	}
 }
 
 // NewCustomQueueWorker creates Worker instance with Custom Queue
 func (server *Server) NewCustomQueueWorker(consumerTag string, concurrency int, queue string) *Worker {
 	return &Worker{
-		server:      server,
-		ConsumerTag: consumerTag,
-		Concurrency: concurrency,
-		Queue:       queue,
+		server:          server,
+		ConsumerTag:     consumerTag,
+		Concurrency:     concurrency,
+		Queue:           queue,
+		preTaskHandler:  defaultPreTaskHandler,
+		postTaskHandler: defaultPostTaskHandler,
 	}
 }
 
@@ -121,7 +134,22 @@ func (server *Server) SetConfig(cnf *config.Config) {
 
 // SetPreTaskHandler Sets pre publish handler
 func (server *Server) SetPreTaskHandler(handler func(*tasks.Signature)) {
-	server.prePublishHandler = handler
+	server.prePublishHandler = func(ctx context.Context, signature *tasks.Signature) func() {
+		handler(signature)
+		// preserve opentracing behavior
+		return defaultPrePublishHandler(ctx, signature)
+	}
+}
+
+// SetPreTaskContextHandler Sets pre publish handler using a task context
+func (server *Server) SetPreTaskContextHandler(handler func(context.Context, *tasks.Signature) func()) {
+	server.prePublishHandler = func(ctx context.Context, signature *tasks.Signature) func() {
+		// preserve opentracing behavior
+		f1 := defaultPrePublishHandler(ctx, signature)
+		f2 := handler(ctx, signature)
+
+		return finishFunc(f1, f2)
+	}
 }
 
 // RegisterTasks registers all tasks at once
@@ -165,11 +193,6 @@ func (server *Server) GetRegisteredTask(name string) (interface{}, error) {
 
 // SendTaskWithContext will inject the trace context in the signature headers before publishing it
 func (server *Server) SendTaskWithContext(ctx context.Context, signature *tasks.Signature) (*result.AsyncResult, error) {
-	span, _ := opentracing.StartSpanFromContext(ctx, "SendTask", tracing.ProducerOption(), tracing.MachineryTag)
-	defer span.Finish()
-
-	// tag the span with some info about the signature
-	signature.Headers = tracing.HeadersWithSpan(signature.Headers, span)
 
 	// Make sure result backend is defined
 	if server.backend == nil {
@@ -188,7 +211,8 @@ func (server *Server) SendTaskWithContext(ctx context.Context, signature *tasks.
 	}
 
 	if server.prePublishHandler != nil {
-		server.prePublishHandler(signature)
+		finish := server.prePublishHandler(ctx, signature)
+		defer finish()
 	}
 
 	if err := server.broker.Publish(ctx, signature); err != nil {
@@ -205,10 +229,10 @@ func (server *Server) SendTask(signature *tasks.Signature) (*result.AsyncResult,
 
 // SendChainWithContext will inject the trace context in all the signature headers before publishing it
 func (server *Server) SendChainWithContext(ctx context.Context, chain *tasks.Chain) (*result.ChainAsyncResult, error) {
-	span, _ := opentracing.StartSpanFromContext(ctx, "SendChain", tracing.ProducerOption(), tracing.MachineryTag, tracing.WorkflowChainTag)
-	defer span.Finish()
-
-	tracing.AnnotateSpanWithChainInfo(span, chain)
+	if server.preChainPublishHandler != nil {
+		finish := server.preChainPublishHandler(ctx, chain)
+		defer finish()
+	}
 
 	return server.SendChain(chain)
 }
@@ -225,10 +249,10 @@ func (server *Server) SendChain(chain *tasks.Chain) (*result.ChainAsyncResult, e
 
 // SendGroupWithContext will inject the trace context in all the signature headers before publishing it
 func (server *Server) SendGroupWithContext(ctx context.Context, group *tasks.Group, sendConcurrency int) ([]*result.AsyncResult, error) {
-	span, _ := opentracing.StartSpanFromContext(ctx, "SendGroup", tracing.ProducerOption(), tracing.MachineryTag, tracing.WorkflowGroupTag)
-	defer span.Finish()
-
-	tracing.AnnotateSpanWithGroupInfo(span, group, sendConcurrency)
+	if server.preGroupPublishHandler != nil {
+		finish := server.preGroupPublishHandler(ctx, group, sendConcurrency)
+		defer finish()
+	}
 
 	// Make sure result backend is defined
 	if server.backend == nil {
@@ -306,10 +330,11 @@ func (server *Server) SendGroup(group *tasks.Group, sendConcurrency int) ([]*res
 
 // SendChordWithContext will inject the trace context in all the signature headers before publishing it
 func (server *Server) SendChordWithContext(ctx context.Context, chord *tasks.Chord, sendConcurrency int) (*result.ChordAsyncResult, error) {
-	span, _ := opentracing.StartSpanFromContext(ctx, "SendChord", tracing.ProducerOption(), tracing.MachineryTag, tracing.WorkflowChordTag)
-	defer span.Finish()
 
-	tracing.AnnotateSpanWithChordInfo(span, chord, sendConcurrency)
+	if server.preChordPublishHandler != nil {
+		finish := server.preChordPublishHandler(ctx, chord, sendConcurrency)
+		defer finish()
+	}
 
 	_, err := server.SendGroupWithContext(ctx, chord.Group, sendConcurrency)
 	if err != nil {
