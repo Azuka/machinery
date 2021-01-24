@@ -1,9 +1,10 @@
-module github.com/RichardKnop/machinery/v1
+module github.com/RichardKnop/machinery
 
 require (
 	cloud.google.com/go v0.72.0 // indirect
 	cloud.google.com/go/pubsub v1.8.3
 	github.com/RichardKnop/logging v0.0.0-20190827224416-1a693bdd4fae
+	github.com/RichardKnop/machinery/v2 v2.0.3
 	github.com/aws/aws-sdk-go v1.35.35
 	github.com/bradfitz/gomemcache v0.0.0-20190913173617-a41fca850d0b
 	github.com/cpuguy83/go-md2man/v2 v2.0.0 // indirect
